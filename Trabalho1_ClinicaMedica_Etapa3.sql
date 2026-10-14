@@ -136,6 +136,8 @@ CREATE TABLE consulta_procedimento (
 	PRIMARY KEY (id_consulta, id_procedimento)
 );
 
+ALTER TABLE conta ALTER COLUMN valor_procedimento SET DEFAULT 0;
+ALTER TABLE conta ALTER COLUMN valor_consulta      SET DEFAULT 0;
 ---================================================================================
 --ETAPA 3 GATILHOS E FUNÇÕES
 ---================================================================================
@@ -229,3 +231,128 @@ BEFORE INSERT OR UPDATE OF data_hora_marcado, id_medico
 ON consulta
 FOR EACH ROW
 EXECUTE FUNCTION fn_valida_horario_medico();
+
+
+CREATE OR REPLACE FUNCTION fn_atualiza_valor_procedimento_conta()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_consulta_old INTEGER;
+    v_consulta_new INTEGER;
+BEGIN
+    IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        v_consulta_old := OLD.id_consulta;
+    END IF;
+    IF TG_OP IN ('INSERT', 'UPDATE') THEN
+        v_consulta_new := NEW.id_consulta;
+    END IF;
+
+    -- Recalcula a(s) conta(s) afetada(s).
+    -- Se valor_unitario não foi informado, usa o valor cadastrado no procedimento.
+    UPDATE conta ct
+    SET valor_procedimento = (
+        SELECT COALESCE(SUM(cp.quantidade * COALESCE(cp.valor_unitario, p.valor)), 0)
+        FROM consulta c
+        JOIN consulta_procedimento cp ON cp.id_consulta = c.id_consulta
+        JOIN procedimento p ON p.id_procedimento = cp.id_procedimento
+        WHERE c.id_conta = ct.id_conta
+    )
+    WHERE ct.id_conta IN (
+        SELECT id_conta
+        FROM consulta
+        WHERE id_consulta IN (v_consulta_old, v_consulta_new)
+    );
+
+    RETURN NULL; -- gatilho AFTER: o retorno é ignorado
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_atualiza_valor_procedimento_conta
+AFTER INSERT OR UPDATE OR DELETE
+ON consulta_procedimento
+FOR EACH ROW
+EXECUTE FUNCTION fn_atualiza_valor_procedimento_conta();
+
+
+TRUNCATE consulta_procedimento, pagamento, consulta, conta, horario_medico,
+         telefone_medico, medico_especialidade, especialidade, medico, horario,
+         procedimento, sala, plano_convenio, telefone_paciente, paciente, convenio
+RESTART IDENTITY CASCADE;
+
+INSERT INTO convenio (nome) VALUES ('Unimed');
+
+INSERT INTO paciente (nome, data_nasc, cpf, rg, sexo, endereco, "e-mail") VALUES
+('Maria Silva', '1990-05-10', '111.111.111-11', '1111111', 'FEMININO', 'Rua A, 100', 'maria@email.com'),
+('João Souza',  '1985-03-22', '222.222.222-22', '2222222', 'MASCULINO', 'Rua B, 200', 'joao@email.com');
+
+-- Maria: plano válido | João: plano vencido
+INSERT INTO plano_convenio (id_paciente, id_convenio, numero_carteirinha, validade, tipo_plano) VALUES
+(1, 1, 'CART-001', '2027-12-31', 'ENFERMARIA'),
+(2, 1, 'CART-002', '2025-01-31', 'APARTAMENTO');
+
+INSERT INTO sala (descricao) VALUES ('Consultório 1'), ('Consultório 2');
+
+INSERT INTO procedimento (descricao, valor) VALUES
+('Eletrocardiograma', 80.00),
+('Curativo', 30.00);
+
+INSERT INTO medico (nome_medico, percentual_honorario, crm) VALUES
+('Dra. Ana Lima', 40.00, 'CRM-SC 12345');
+
+INSERT INTO especialidade (nome_especialidade) VALUES ('Cardiologia');
+INSERT INTO medico_especialidade (id_medico, id_especialidade) VALUES (1, 1);
+
+-- Atende às segundas, das 08:00 às 12:00
+INSERT INTO horario (hora_inicio, hora_fim, dia_semana) VALUES ('08:00', '12:00', 'SEGUNDA');
+INSERT INTO horario_medico (id_medico, id_horario) VALUES (1, 1);
+
+-- Uma conta por consulta (valor da consulta = 200)
+INSERT INTO conta (valor_consulta) VALUES (200.00), (200.00);
+
+-- 19/10/2026 é segunda-feira
+INSERT INTO consulta (data_hora_marcado, status, id_paciente, id_medico, id_sala, id_conta) VALUES
+('2026-10-19 09:00', 'AGENDADA', 1, 1, 1, 1),
+('2026-10-19 10:00', 'AGENDADA', 2, 1, 2, 2);
+
+
+
+-- ERRO (gatilho 1): mesmo médico no mesmo horário
+INSERT INTO consulta (data_hora_marcado, status, id_paciente, id_medico, id_sala, id_conta)
+VALUES ('2026-10-19 09:00', 'AGENDADA', 2, 1, 2, 2);
+
+-- ERRO (gatilho 2): terça-feira, médico não atende
+INSERT INTO consulta (data_hora_marcado, status, id_paciente, id_medico, id_sala, id_conta)
+VALUES ('2026-10-20 09:00', 'AGENDADA', 2, 1, 2, 2);
+
+--gatilho 3 - conta recalculada
+INSERT INTO consulta_procedimento (id_consulta, id_procedimento, quantidade) VALUES (1, 1, 2);
+SELECT * FROM conta WHERE id_conta = 1;
+-- esperado: valor_procedimento = 160.00, valor_total = 360.00
+
+INSERT INTO consulta_procedimento (id_consulta, id_procedimento, quantidade) VALUES (1, 2, 1);
+SELECT * FROM conta WHERE id_conta = 1;
+-- esperado: valor_procedimento = 190.00, valor_total = 390.00
+
+DELETE FROM consulta_procedimento WHERE id_consulta = 1 AND id_procedimento = 2;
+SELECT * FROM conta WHERE id_conta = 1;
+-- esperado: volta para 160.00 / 360.00
+
+--GATILHO 4
+-- OK: pagamento parcial em PIX
+INSERT INTO pagamento (data_pagamento, valor_pago, forma_pagamento, possui_convenio, id_conta)
+VALUES (CURRENT_DATE, 100, 'PIX', FALSE, 1);
+
+-- OK: convênio válido (Maria) -> pago até agora: 200 de 360
+INSERT INTO pagamento (data_pagamento, valor_pago, forma_pagamento, possui_convenio, valor_convenio, id_conta)
+VALUES (CURRENT_DATE, 0, 'CARTAO', TRUE, 100, 1);
+
+-- ERRO: excede o total (200 + 200 > 360)
+INSERT INTO pagamento (data_pagamento, valor_pago, forma_pagamento, possui_convenio, id_conta)
+VALUES (CURRENT_DATE, 200, 'DINHEIRO', FALSE, 1);
+
+-- ERRO: convênio vencido (João)
+INSERT INTO pagamento (data_pagamento, valor_pago, forma_pagamento, possui_convenio, valor_convenio, id_conta)
+VALUES (CURRENT_DATE, 50, 'CARTAO', TRUE, 100, 2);
+
+-- ERRO: valor_convenio sem possui_convenio
+INSERT INTO pagamento (data_pagamento, valor_pago, forma_pagamento, possui_convenio, valor_convenio, id_conta)
+VALUES (CURRENT_DATE, 50, 'PIX', FALSE, 100, 2);
